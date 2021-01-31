@@ -169,7 +169,7 @@ struct agx_insn agx_decode_load_store(uint16_t const *buf) {
 	insn.op = is_load ? AGX_OP_LD : AGX_OP_ST;
 
 	// in memory size
-	insn.control = 8<<field_extract(buf, 7, 3).val;
+	insn.control = 8<<field_extract(buf, 7, 2).val;
 	insn.flags |= AGX_INSN_CTRL;
 
 	struct field addr = field_extract(buf, 17, 3);
@@ -203,6 +203,22 @@ struct agx_insn agx_decode_load_store(uint16_t const *buf) {
 	} else {
 		*rr = make_src(AGX_SRC_TYPE_REG, AGX_SRC_SIZE32,
 				0, 0, 1, reg.val);
+	}
+
+	// number of elements seems to actually be encoded as a mask
+	// XXX: determine if we can ever get masks with holes.
+	struct field elem_mask = field_extract(buf, 52, 4);
+	switch (elem_mask.val) {
+		case 1: // just one element
+			break;
+		case 3: // two elements, writing both
+			rr->nr_regs = 2;
+			break;
+		case 0xf: // four elements, writing all
+			rr->nr_regs = 4;
+			break;
+		default:
+			assert(!"unhandled elem mask");
 	}
 
 	return insn;
