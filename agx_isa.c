@@ -34,7 +34,7 @@ enum agx_src_type {
 struct agx_src {
 	uint32_t type:3;
 	uint32_t size:1;
-	uint32_t flags:4;
+	uint32_t flags:5;
 	uint32_t shift:3;
 	uint32_t nr_regs:5;
 	uint32_t value;
@@ -50,6 +50,7 @@ struct agx_src make_src(uint32_t type, uint32_t size, uint32_t flags,
 enum agx_insn_flags {
 	AGX_INSN_DEP = 1<<0,
 	AGX_INSN_COND = 1<<1,
+	AGX_INSN_CTRL = 1<<2,
 };
 
 /* Note: logical opcode. actual encodings vary */
@@ -81,7 +82,7 @@ struct agx_insn {
 	struct agx_src dst;
 	struct agx_src srcs[4];
 	uint32_t op : 16;
-	uint32_t flags : 2;
+	uint32_t flags : 3;
 	uint32_t control : 14;
 };
 
@@ -162,16 +163,14 @@ struct agx_insn agx_decode_fcsel(uint16_t const *buf) {
 	return insn;
 }
 
-struct agx_insn agx_decode_load(uint16_t const *buf) {
+struct agx_insn agx_decode_load_store(uint16_t const *buf) {
 	struct agx_insn insn = { 0 };
-	insn.op = AGX_OP_LD;
+	bool is_load = field_extract(buf, 6, 1).val == 0;
+	insn.op = is_load ? AGX_OP_LD : AGX_OP_ST;
 
-	struct field dst = field_extract(buf, 10, 6);
-	field_concat(&dst, buf, 40, 2);
-
-	/* XXX: load size??? for now, let's assume everything is 32 */
-	insn.dst = make_src(AGX_SRC_TYPE_REG, AGX_SRC_SIZE32,
-			0, 0, 1, dst.val);
+	// in memory size
+	insn.control = 8<<field_extract(buf, 7, 3).val;
+	insn.flags |= AGX_INSN_CTRL;
 
 	struct field addr = field_extract(buf, 17, 3);
 	field_concat(&addr, buf, 36, 4);
@@ -182,29 +181,7 @@ struct agx_insn agx_decode_load(uint16_t const *buf) {
 	bool ua = field_extract(buf, 27, 1).val != 0;
 	bool ic = field_extract(buf, 24, 1).val != 0;
 
-	insn.srcs[0] = make_src(ua ? AGX_SRC_TYPE_UNIFORM : AGX_SRC_TYPE_REG,
-			AGX_SRC_SIZE32,
-			0, 0, 2, addr.val);
-
-	insn.srcs[1] = make_src(ic ? AGX_SRC_TYPE_IMMEDIATE : AGX_SRC_TYPE_REG,
-			AGX_SRC_SIZE32,
-			0, 0, 1, idx.val);
-
-	return insn;
-}
-
-struct agx_insn agx_decode_store(uint16_t const *buf) {
-	struct agx_insn insn = { 0 };
-	insn.op = AGX_OP_ST;
-
-	struct field addr = field_extract(buf, 17, 3);
-	field_concat(&addr, buf, 36, 4);
-
-	struct field idx = field_extract(buf, 21, 3);
-	field_concat(&idx, buf, 32, 4);
-
-	bool ua = field_extract(buf, 27, 1).val != 0;
-	bool ic = field_extract(buf, 24, 1).val != 0;
+	struct field shift = field_extract(buf, 42, 2);
 
 	insn.srcs[0] = make_src(ua ? AGX_SRC_TYPE_UNIFORM : AGX_SRC_TYPE_REG,
 			AGX_SRC_SIZE32,
@@ -212,14 +189,21 @@ struct agx_insn agx_decode_store(uint16_t const *buf) {
 
 	insn.srcs[1] = make_src(ic ? AGX_SRC_TYPE_IMMEDIATE : AGX_SRC_TYPE_REG,
 			AGX_SRC_SIZE32,
-			0, 0, 1, idx.val);
+			0, shift.val, 1, idx.val);
 
-	struct field src = field_extract(buf, 10, 6);
-	field_concat(&src, buf, 40, 2);
+	struct field reg = field_extract(buf, 10, 6);
+	field_concat(&reg, buf, 40, 2);
 
-	/* XXX: store size??? for now, let's assume everything is 32 */
-	insn.srcs[2] = make_src(AGX_SRC_TYPE_REG, AGX_SRC_SIZE32,
-			0, 0, 1, src.val);
+	struct agx_src *rr = is_load ? &insn.dst : &insn.srcs[2];
+	bool is_half_reg = field_extract(buf, 49, 1).val == 0;
+
+	if (is_half_reg) {
+		*rr = make_src(AGX_SRC_TYPE_REG, AGX_SRC_SIZE16,
+				(reg.val & 1) ? AGX_SRC_HI : 0, 0, 1, reg.val>>1);
+	} else {
+		*rr = make_src(AGX_SRC_TYPE_REG, AGX_SRC_SIZE32,
+				0, 0, 1, reg.val);
+	}
 
 	return insn;
 }
@@ -253,7 +237,7 @@ struct agx_src agx_decode_float_src(struct field src, struct field type) {
 	}
 
 	switch (type.val & 0x7) {
-		case 0:	// float immediate. XXX: port over tiny float decoder
+		case 0:
 			return make_src(AGX_SRC_TYPE_IMMFLOAT, AGX_SRC_SIZE16,
 					0, 0, 1, src.val);
 		case 1:
@@ -359,16 +343,23 @@ void agx_print_operand(struct agx_src const *src, FILE *fp) {
 		fprintf(fp, ".abs");
 	if (s.flags & AGX_SRC_NEG)
 		fprintf(fp, ".neg");
+	if (s.shift)
+		fprintf(fp, "*%d", 1<<s.shift);
 }
 
 void agx_print_insn(struct agx_insn const *insn, FILE *fp) {
-	fprintf(fp, "%c%s ",
+	fprintf(fp, "%c%s",
 			(insn->flags & AGX_INSN_DEP) ? '+' : ' ',
 			op_names[insn->op]);
 
 	if (insn->flags & AGX_INSN_COND) {
-		fprintf(fp, "%x", insn->control);
+		fprintf(fp, ".cond%x", insn->control);
 	}
+	if (insn->flags & AGX_INSN_CTRL) {
+		fprintf(fp, ".%d", insn->control);
+	}
+
+	fprintf(fp, " ");
 
 	if (insn->dst.type != AGX_SRC_TYPE_NONE) {
 		agx_print_operand(&insn->dst, fp);
@@ -391,10 +382,9 @@ void agx_print_insn(struct agx_insn const *insn, FILE *fp) {
 struct agx_insn_pattern patterns[] = {
 	{ 0x72, 0x807f, 2, agx_decode_movsr },
 	{ 0x02, 0x807f, 4, agx_decode_fcsel },
-	{ 0x05, 0x037f, 4, agx_decode_load },
+	{ 0x05, 0x003f, 4, agx_decode_load_store },
 	{ 0x38, 0xffff, 1, agx_decode_wait },
 	{ 0x8026, 0x813f, 3, agx_decode_fadd16 },
-	{ 0x45, 0x007f, 4, agx_decode_store },
 	{ 0x88, 0x00ff, 1, agx_decode_stop },
 };
 
@@ -405,7 +395,7 @@ void agx_disassemble_one(uint16_t const **p, int *n) {
 		struct agx_insn_pattern const *pat = &patterns[i];
 		if ((**p & pat->mask_bits) == pat->opcode_bits) {
 			struct agx_insn insn = pat->decode(*p);
-			if (q[0] & 0x80)
+			if ((q[0] & 0x80) && insn.op != AGX_OP_LD && insn.op != AGX_OP_ST)
 				insn.flags |= AGX_INSN_DEP;
 
 			printf("%02x %02x ", q[0], q[1]);
